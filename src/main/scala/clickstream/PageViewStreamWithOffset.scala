@@ -1,19 +1,21 @@
 package clickstream
 
+import kafka.message.MessageAndMetadata
 import kafka.serializer.StringDecoder
+import kafka2streaming.SparkOffsets
 import net.sf.json.JSONObject
+import org.apache.hadoop.hbase.{HBaseConfiguration, TableName}
 import org.apache.hadoop.hbase.client.{HTable, Put}
 import org.apache.hadoop.hbase.util.Bytes
-import org.apache.hadoop.hbase.{HBaseConfiguration, TableName}
 import org.apache.spark.SparkConf
-import org.apache.spark.streaming.kafka.KafkaUtils
+import org.apache.spark.streaming.dstream.InputDStream
+import org.apache.spark.streaming.kafka.{HasOffsetRanges, KafkaUtils, OffsetRange}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 
 /**
-  * Created by 郭飞 on 2016/5/31.
+  * Created by 郭飞 on 2016/6/6.
   */
-object PageViewStream {
-
+object PageViewStreamWithOffset {
   def main(args: Array[String]): Unit = {
     var masterUrl = "local[2]"
     if (args.length > 0) {
@@ -23,21 +25,35 @@ object PageViewStream {
     // Create a StreamingContext with the given master URL
     val conf = new SparkConf().setMaster(masterUrl).setAppName("PageViewStream")
     val ssc = new StreamingContext(conf, Seconds(5))
-
+    ssc.checkpoint("check")
     // Kafka configurations
-    //val topics = Set("PageViewStream")
-    val topics = Set("user_events")
+    val topics = "PageViewStream"
+    //val topics = Set("user_events")
     //本地虚拟机ZK地址
     //val brokers = "hadoop1:9092,hadoop2:9092,hadoop3:9092"
     val brokers = "hc4:9092"
+    val groupid = "me"
     val kafkaParams = Map[String, String](
       "metadata.broker.list" -> brokers,
-      "serializer.class" -> "kafka.serializer.StringEncoder")
+      "serializer.class" -> "kafka.serializer.StringEncoder",
+      "group.id"->groupid.toString, "auto.offset.reset"->"smallest")
+
+    // Hold a reference to the current offset ranges, so it can be used downstream
+    var offsetRanges = Array[OffsetRange]()
 
     // Create a direct stream
-    val kafkaStream = KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](ssc, kafkaParams, topics)
+    //val kafkaStream = KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](ssc, kafkaParams, topics)
 
-    val events = kafkaStream.flatMap(line => {
+    val sparkOffsets: SparkOffsets= new SparkOffsets()
+    val messageHandler = (mmd: MessageAndMetadata[String, String]) => (mmd.topic, mmd.message())
+    val kafkaStream: InputDStream[(String, String)]= KafkaUtils.createDirectStream[String, String,StringDecoder,
+      StringDecoder,(String,String)](ssc, kafkaParams,sparkOffsets.myFromOffsets(topics,groupid),messageHandler)
+
+    val events = kafkaStream.transform { rdd =>
+      offsetRanges = rdd.asInstanceOf[HasOffsetRanges].offsetRanges
+      rdd
+    }.flatMap(line => {
+
       val data = JSONObject.fromObject(line._2)
       Some(data)
     })
@@ -45,7 +61,13 @@ object PageViewStream {
     // Compute user click times
     val userClicks = events.map(x => (x.getString("uid"), x.getInt("click_count"))).reduceByKey(_ + _)
     userClicks.foreachRDD(rdd => {
+
       rdd.foreachPartition(partitionOfRecords => {
+
+        for (o <- offsetRanges) {
+          println(s"${o.topic} ${o.partition} ${o.fromOffset} ${o.untilOffset}")
+        }
+
         //Hbase配置
         val tableName = "PageViewStream"
         val hbaseConf = HBaseConfiguration.create()
@@ -73,6 +95,7 @@ object PageViewStream {
         })
       })
     })
+    sparkOffsets.saveOffers(kafkaStream,groupid)
     ssc.start()
     ssc.awaitTermination()
 

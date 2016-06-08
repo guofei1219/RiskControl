@@ -30,7 +30,7 @@ object KafkaMessageGenerator {
   }
 
   def main(args: Array[String]): Unit = {
-    val topic = "user_events"
+    val topic = "PageViewStream"
     //本地虚拟机ZK地址
     //val brokers = "hadoop1:9092,hadoop2:9092,hadoop3:9092"
     val brokers = "hc4:9092"
